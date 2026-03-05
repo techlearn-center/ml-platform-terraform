@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Time** | 3-5 hours |
-| **Difficulty** | Beginner |
-| **Prerequisites** | Module 02 completed |
+| **Difficulty** | Intermediate |
+| **Prerequisites** | Modules 01-02 completed, VPC deployed |
 
 ---
 
@@ -12,116 +12,246 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of SageMaker with Terraform
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Deploy SageMaker Studio domain in VPC-only mode with Terraform
+- Create user profiles for data scientists and ML engineers
+- Provision notebook instances with auto-stop lifecycle configuration
+- Set up a SageMaker Model Package Group for model versioning
+- Configure KMS encryption for notebooks and training data
+- Submit SageMaker training jobs using the Python SDK
 
 ---
 
 ## Concepts
 
-### What is SageMaker with Terraform?
+### SageMaker Components
 
-SageMaker with Terraform is a fundamental component of ML Platform with Terraform: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+| Component | Purpose | Terraform Resource |
+|---|---|---|
+| **Studio Domain** | Managed IDE with JupyterLab, code editor, terminals | `aws_sagemaker_domain` |
+| **User Profile** | Per-user settings within a Studio domain | `aws_sagemaker_user_profile` |
+| **Notebook Instance** | Standalone managed Jupyter notebook (EC2-backed) | `aws_sagemaker_notebook_instance` |
+| **Processing Job** | Run data preprocessing or evaluation scripts | Created via SDK/API |
+| **Training Job** | Run model training with managed infrastructure | Created via SDK/API |
+| **Model Package Group** | Versioned model registry for approval workflows | `aws_sagemaker_model_package_group` |
+| **Endpoint** | Real-time inference serving | Created via SDK/API or Terraform |
 
-**Real-world analogy:** Think of SageMaker with Terraform like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+### SageMaker Architecture in Our Platform
 
-### Why Does This Matter?
-
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
-
-### Key Terminology
-
-| Term | Definition |
-|---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+```
++------------------------------------------------------------+
+|  SageMaker Studio Domain (VPC-only mode)                   |
+|  +--------------------------+  +------------------------+  |
+|  | User: data-scientist     |  | User: ml-engineer      |  |
+|  | - JupyterLab             |  | - JupyterLab           |  |
+|  | - Code Editor            |  | - Code Editor          |  |
+|  | - Terminal               |  | - Pipeline Builder     |  |
+|  +--------------------------+  +------------------------+  |
++------------------------------------------------------------+
+        |                                    |
+        v                                    v
++------------------+              +-------------------+
+| Training Jobs    |              | Model Registry    |
+| ml.m5.xlarge     |              | (Package Group)   |
+| - Input: S3      |              | - Version 1.0     |
+| - Output: S3     |              | - Version 1.1     |
+| - Metrics: CW    |              | - Approved/Rejected|
++------------------+              +-------------------+
+        |                                    |
+        v                                    v
++------------------+              +-------------------+
+| Model Artifacts  |              | Inference Endpoint|
+| s3://models/     |              | ml.m5.large       |
++------------------+              +-------------------+
+```
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Exercise 1: Deploy the SageMaker Module
 
-Before starting, verify your environment:
+**Step 1:** Review the SageMaker Terraform configuration:
 
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
-
-# Check you have the project cloned
-ls modules/03-sagemaker-terraform/
+cat terraform/modules/sagemaker/main.tf
 ```
 
-### Exercise 1: Setup and Configuration
+Key configuration for the Studio domain:
 
-**Goal:** Get the foundation in place for this module.
+```hcl
+resource "aws_sagemaker_domain" "studio" {
+  domain_name = "${var.project_name}-${var.environment}-studio"
+  auth_mode   = "IAM"
+  vpc_id      = var.vpc_id
+  subnet_ids  = var.private_subnet_ids
 
-**Step 1:** Review the starter files
+  default_user_settings {
+    execution_role  = var.sagemaker_execution_role_arn
+    security_groups = [var.sagemaker_security_group_id]
+
+    sharing_settings {
+      notebook_output_option = "Allowed"
+      s3_kms_key_id          = var.kms_key_arn
+    }
+  }
+
+  kms_key_id = var.kms_key_arn  # Encrypt EFS storage
+}
+```
+
+**Step 2:** Deploy the SageMaker module (requires VPC and IAM modules):
+
 ```bash
-ls modules/03-sagemaker-terraform/lab/starter/
+cd terraform/
+
+# Plan the full deployment
+terraform plan
+
+# Apply SageMaker and its dependencies
+terraform apply -target=module.iam -target=module.s3
+terraform apply -target=module.sagemaker
 ```
 
-**Step 2:** Set up the required environment
+**Step 3:** Verify the domain was created:
+
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/03-sagemaker-terraform/lab/starter/
+# Get Studio domain ID
+terraform output sagemaker_studio_domain_id
+
+# Get the Studio URL
+terraform output sagemaker_studio_url
 ```
 
-**Step 3:** Verify the setup
+### Exercise 2: Notebook Instance with Auto-Stop
+
+The module provisions a standalone notebook instance with a lifecycle configuration that automatically stops idle notebooks:
+
+```hcl
+resource "aws_sagemaker_notebook_instance" "main" {
+  name                    = "${var.project_name}-${var.environment}-notebook"
+  role_arn                = var.sagemaker_execution_role_arn
+  instance_type           = var.notebook_instance_type
+  subnet_id               = var.private_subnet_ids[0]
+  security_groups         = [var.sagemaker_security_group_id]
+  kms_key_id              = var.kms_key_arn
+  direct_internet_access  = "Disabled"   # VPC-only mode
+  root_access             = "Disabled"   # Security best practice
+  volume_size             = 50
+
+  lifecycle_config_name = aws_sagemaker_notebook_instance_lifecycle_configuration.auto_stop.name
+}
+```
+
+**Verify the notebook instance:**
+
 ```bash
-# Run the validation to check your setup
-bash modules/03-sagemaker-terraform/validation/validate.sh
+aws sagemaker describe-notebook-instance \
+  --notebook-instance-name ml-platform-dev-notebook \
+  --query '{Status:NotebookInstanceStatus,InstanceType:InstanceType,DirectInternet:DirectInternetAccess}'
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+### Exercise 3: Submit a Training Job with Python SDK
 
-### Exercise 2: Core Implementation
+Create a Python script to submit a SageMaker training job:
 
-**Goal:** Implement the main concept of this module.
+```python
+# scripts/submit_training_job.py
+import boto3
+import sagemaker
+from sagemaker.estimator import Estimator
+from dotenv import load_dotenv
+import os
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+load_dotenv()
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+# Initialize SageMaker session
+session = sagemaker.Session()
+role = os.getenv("SAGEMAKER_ROLE_ARN")
+bucket = os.getenv("MODEL_ARTIFACTS_BUCKET")
 
-### Exercise 3: Integration and Testing
+# Define the training estimator
+estimator = Estimator(
+    image_uri=sagemaker.image_uris.retrieve("xgboost", session.boto_region_name, "1.7-1"),
+    role=role,
+    instance_count=1,
+    instance_type="ml.m5.xlarge",
+    output_path=f"s3://{bucket}/training-output",
+    sagemaker_session=session,
+    encrypt_inter_container_traffic=True,
+    subnets=os.getenv("PRIVATE_SUBNET_IDS", "").split(","),
+    security_group_ids=[os.getenv("SAGEMAKER_SECURITY_GROUP_ID")],
+    hyperparameters={
+        "max_depth": 5,
+        "eta": 0.2,
+        "gamma": 4,
+        "min_child_weight": 6,
+        "subsample": 0.8,
+        "objective": "binary:logistic",
+        "num_round": 100,
+    },
+    tags=[
+        {"Key": "Project", "Value": "ml-platform"},
+        {"Key": "Environment", "Value": "dev"},
+    ],
+)
 
-**Goal:** Connect this module's work with the broader system.
+# Start training (uses VPC networking)
+training_input = sagemaker.inputs.TrainingInput(
+    s3_data=f"s3://{os.getenv('DATA_LAKE_BUCKET')}/processed/train/",
+    content_type="csv",
+)
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+estimator.fit({"train": training_input}, wait=True)
+
+print(f"Model artifacts: {estimator.model_data}")
+print(f"Training job: {estimator.latest_training_job.name}")
+```
+
+### Exercise 4: Register a Model in the Package Group
+
+```python
+# scripts/register_model.py
+import boto3
+import sagemaker
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+sm_client = boto3.client("sagemaker")
+
+# Register a model version
+response = sm_client.create_model_package(
+    ModelPackageGroupName=f"{os.getenv('PROJECT_NAME', 'ml-platform')}-dev-models",
+    ModelPackageDescription="XGBoost classifier v1.0",
+    InferenceSpecification={
+        "Containers": [
+            {
+                "Image": sagemaker.image_uris.retrieve("xgboost", "us-east-1", "1.7-1"),
+                "ModelDataUrl": "s3://ml-platform-dev-model-artifacts/training-output/model.tar.gz",
+            }
+        ],
+        "SupportedContentTypes": ["text/csv"],
+        "SupportedResponseMIMETypes": ["text/csv"],
+    },
+    ModelApprovalStatus="PendingManualApproval",
+)
+
+print(f"Model package ARN: {response['ModelPackageArn']}")
+```
 
 ---
 
-## Starter Files
+## SageMaker Instance Type Guide
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
-
-## Solution Files
-
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+| Use Case | Recommended Instance | vCPU | Memory | GPU | Cost/hr (on-demand) |
+|---|---|---|---|---|---|
+| Notebooks / exploration | ml.t3.medium | 2 | 4 GiB | - | ~$0.05 |
+| Data preprocessing | ml.m5.xlarge | 4 | 16 GiB | - | ~$0.23 |
+| Model training (CPU) | ml.m5.2xlarge | 8 | 32 GiB | - | ~$0.46 |
+| Model training (GPU) | ml.g4dn.xlarge | 4 | 16 GiB | 1x T4 | ~$0.74 |
+| Deep learning training | ml.p3.2xlarge | 8 | 61 GiB | 1x V100 | ~$3.83 |
+| Inference endpoint | ml.m5.large | 2 | 8 GiB | - | ~$0.12 |
 
 ---
 
@@ -129,32 +259,32 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| Public internet on notebooks | Security audit failure | Set `direct_internet_access = "Disabled"` |
+| Root access enabled | Privilege escalation risk | Set `root_access = "Disabled"` |
+| Missing KMS encryption | Compliance violation | Set `kms_key_id` on domain and notebooks |
+| No auto-stop lifecycle | Runaway notebook costs | Attach lifecycle configuration |
+| Wrong subnet for notebook | Cannot reach S3/ECR | Use private subnet with VPC endpoints |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of SageMaker with Terraform?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. What is the difference between SageMaker Studio and a standalone notebook instance?
+2. Why do we set `direct_internet_access = "Disabled"` on the notebook instance?
+3. How does the auto-stop lifecycle configuration help with cost management?
+4. What role does the Model Package Group play in the ML lifecycle?
+5. Why do we encrypt inter-container traffic during training?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
+- [ ] SageMaker Studio domain is deployed in VPC-only mode
+- [ ] Two user profiles are created (data-scientist, ml-engineer)
+- [ ] Notebook instance is running with auto-stop lifecycle
+- [ ] Model Package Group exists for model versioning
+- [ ] KMS encryption is enabled for all SageMaker resources
 - [ ] Validation script passes: `bash modules/03-sagemaker-terraform/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
 
 ---
 
@@ -162,24 +292,28 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: Studio domain fails to create**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+# Check if a domain already exists (only one per region per account)
+aws sagemaker list-domains --query 'Domains[*].{ID:DomainId,Name:DomainName,Status:Status}'
 ```
 
-**Issue: Permission denied**
+**Issue: Notebook instance stuck in "Pending"**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+# Check the CloudWatch logs
+aws logs get-log-events \
+  --log-group-name /aws/sagemaker/NotebookInstances \
+  --log-stream-name ml-platform-dev-notebook/jupyter-server
+```
+
+**Issue: Training job fails with VPC error**
+```bash
+# Verify the execution role has VPC permissions
+aws iam simulate-principal-policy \
+  --policy-source-arn $(terraform output -raw sagemaker_execution_role_arn) \
+  --action-names ec2:CreateNetworkInterface ec2:DescribeNetworkInterfaces
 ```
 
 ---
 
-**Next: [Module 04 →](../04-mlflow-infrastructure/)**
+**Next: [Module 04 - MLflow Infrastructure -->](../04-mlflow-infrastructure/)**

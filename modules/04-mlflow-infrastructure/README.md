@@ -1,10 +1,10 @@
-# Module 04: MLflow Infrastructure Setup
+# Module 04: MLflow on AWS (ECS Fargate + RDS + S3)
 
 | | |
 |---|---|
 | **Time** | 3-5 hours |
 | **Difficulty** | Intermediate |
-| **Prerequisites** | Module 03 completed |
+| **Prerequisites** | Modules 01-03 completed, VPC and IAM deployed |
 
 ---
 
@@ -12,116 +12,251 @@
 
 By the end of this module, you will be able to:
 
-- Understand the core concepts of MLflow Infrastructure Setup
-- Set up and configure the required tools and environments
-- Complete hands-on exercises that demonstrate practical skills
-- Apply these skills in real-world scenarios
-- Pass the module validation to prove your understanding
+- Deploy MLflow tracking server on ECS Fargate with Terraform
+- Configure RDS PostgreSQL as the MLflow backend metadata store
+- Set up S3 as the MLflow artifact store
+- Expose the MLflow UI via an internal Application Load Balancer
+- Log experiments from SageMaker training jobs to MLflow
+- Query experiment metrics programmatically with the MLflow Python client
 
 ---
 
 ## Concepts
 
-### What is MLflow Infrastructure Setup?
+### Why MLflow for Experiment Tracking?
 
-MLflow Infrastructure Setup is a fundamental component of ML Platform with Terraform: Zero to Hero. In production environments, this skill is used daily by engineers to build, deploy, and maintain reliable systems.
+Without experiment tracking, data scientists lose track of which hyperparameters produced which results. MLflow provides:
 
-**Real-world analogy:** Think of MLflow Infrastructure Setup like learning to read a map before navigating a city. Once you understand the fundamentals, you can find your way through any complex system.
+- **Experiment Tracking** -- Log parameters, metrics, and artifacts for every run
+- **Model Registry** -- Version and stage models (Staging, Production, Archived)
+- **Artifact Store** -- Centralized storage for model binaries, plots, data samples
+- **Reproducibility** -- Every run records code version, environment, and inputs
 
-### Why Does This Matter?
+### MLflow Architecture on AWS
 
-Companies like Google, Netflix, Amazon, and Meta rely on these practices to:
-- Deploy thousands of times per day
-- Maintain 99.99% uptime
-- Scale to millions of users
-- Recover from failures in minutes
+```
++----------------------------------------------------------------+
+|                    MLflow on AWS Architecture                    |
++----------------------------------------------------------------+
+|                                                                  |
+|  +-----------+     +------------------+     +----------------+  |
+|  |  Data     |     |  ALB (internal)  |     |  S3 Artifact   |  |
+|  |  Scientist|---->|  Port 80         |     |  Store         |  |
+|  |  Notebook |     |  /mlflow         |     |  s3://mlflow/  |  |
+|  +-----------+     +--------+---------+     +-------+--------+  |
+|                             |                       ^            |
+|                             v                       |            |
+|                    +--------+---------+             |            |
+|                    |  ECS Fargate     |             |            |
+|                    |  MLflow Server   +-------------+            |
+|                    |  Port 5000       |  artifacts               |
+|                    +--------+---------+                          |
+|                             |                                    |
+|                             v  metadata                          |
+|                    +--------+---------+                          |
+|                    |  RDS PostgreSQL  |                          |
+|                    |  Port 5432       |                          |
+|                    |  mlflow database |                          |
+|                    +------------------+                          |
++----------------------------------------------------------------+
+```
 
 ### Key Terminology
 
 | Term | Definition |
 |---|---|
-| **Core concept 1** | The foundational building block of this module |
-| **Core concept 2** | How components interact and communicate |
-| **Core concept 3** | The pattern used for reliability and scale |
-| **Best practice** | The industry-standard approach to implementation |
+| **Tracking Server** | Central server that records experiment data (params, metrics, artifacts) |
+| **Backend Store** | Database (PostgreSQL) for storing experiment metadata |
+| **Artifact Store** | Object storage (S3) for storing model files, plots, datasets |
+| **Run** | A single execution of a training script with logged data |
+| **Experiment** | A collection of related runs (e.g., "fraud-detection-v2") |
+| **ECS Fargate** | Serverless container hosting -- no EC2 instances to manage |
 
 ---
 
 ## Hands-On Lab
 
-### Prerequisites Check
+### Exercise 1: Deploy the MLflow Module
 
-Before starting, verify your environment:
+**Step 1:** Review the MLflow Terraform configuration:
 
 ```bash
-# Check Docker is running
-docker --version
-docker compose version
-
-# Check you have the project cloned
-ls modules/04-mlflow-infrastructure/
+cat terraform/modules/mlflow/main.tf
 ```
 
-### Exercise 1: Setup and Configuration
+Key resources:
+- `aws_db_instance.mlflow` -- RDS PostgreSQL for metadata
+- `aws_ecs_cluster.mlflow` -- ECS cluster for the container
+- `aws_ecs_task_definition.mlflow` -- Fargate task with MLflow image
+- `aws_ecs_service.mlflow` -- Service maintaining desired container count
+- `aws_lb.mlflow` -- Internal ALB for HTTP access
 
-**Goal:** Get the foundation in place for this module.
+**Step 2:** Deploy the MLflow stack:
 
-**Step 1:** Review the starter files
 ```bash
-ls modules/04-mlflow-infrastructure/lab/starter/
+cd terraform/
+
+# Apply the MLflow module (depends on VPC, IAM, S3)
+terraform apply -target=module.mlflow
 ```
 
-**Step 2:** Set up the required environment
+**Step 3:** Get the MLflow tracking URI:
+
 ```bash
-# Follow the specific setup for this module
-# Each command is explained below
-cd modules/04-mlflow-infrastructure/lab/starter/
+# The ALB DNS name is the MLflow endpoint
+terraform output mlflow_tracking_uri
+# Example: http://ml-platform-dev-mlflow-1234567890.us-east-1.elb.amazonaws.com
 ```
 
-**Step 3:** Verify the setup
+### Exercise 2: Understand the RDS Configuration
+
+The MLflow backend store uses RDS PostgreSQL with these production features:
+
+```hcl
+resource "aws_db_instance" "mlflow" {
+  identifier     = "${var.project_name}-${var.environment}-mlflow"
+  engine         = "postgres"
+  engine_version = "15.4"
+  instance_class = var.db_instance_class     # db.t3.small for dev
+
+  allocated_storage     = 20
+  max_allocated_storage = 100               # Auto-scaling storage
+  storage_encrypted     = true              # Encryption at rest
+
+  db_name  = "mlflow"
+  username = "mlflow"
+  password = random_password.mlflow_db.result  # Generated, stored in Secrets Manager
+
+  db_subnet_group_name   = aws_db_subnet_group.mlflow.name
+  vpc_security_group_ids = [var.rds_security_group_id]
+
+  backup_retention_period = 7               # 7-day backups
+  multi_az               = var.environment == "prod"  # HA in prod only
+
+  skip_final_snapshot = var.environment != "prod"
+  deletion_protection = var.environment == "prod"
+}
+```
+
+**Verify the database:**
+
 ```bash
-# Run the validation to check your setup
-bash modules/04-mlflow-infrastructure/validation/validate.sh
+aws rds describe-db-instances \
+  --db-instance-identifier ml-platform-dev-mlflow \
+  --query 'DBInstances[0].{Status:DBInstanceStatus,Engine:Engine,MultiAZ:MultiAZ,Encrypted:StorageEncrypted}'
 ```
 
-**What you should see:** The validation script will show PASS for setup-related checks.
+### Exercise 3: Log Experiments from Python
 
-### Exercise 2: Core Implementation
+```python
+# scripts/log_experiment.py
+import mlflow
+import mlflow.sklearn
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score
+from dotenv import load_dotenv
+import os
 
-**Goal:** Implement the main concept of this module.
+load_dotenv()
 
-Follow the detailed instructions in the starter directory. The solution directory contains the reference implementation if you get stuck.
+# Point to the MLflow tracking server (ALB endpoint)
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
 
-**Key points:**
-- Read each instruction carefully before executing
-- Understand WHY each step is needed, not just WHAT to do
-- If something fails, check the troubleshooting section below
+# Create or get experiment
+experiment_name = "fraud-detection"
+mlflow.set_experiment(experiment_name)
 
-### Exercise 3: Integration and Testing
+# Generate sample data
+X, y = make_classification(n_samples=10000, n_features=20, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
-**Goal:** Connect this module's work with the broader system.
+# Run experiment with auto-logging
+with mlflow.start_run(run_name="rf-baseline") as run:
+    # Log parameters
+    params = {"n_estimators": 100, "max_depth": 10, "min_samples_split": 5}
+    mlflow.log_params(params)
 
-- Verify your implementation works with previous modules
-- Run all tests and validation scripts
-- Document what you learned
+    # Train model
+    model = RandomForestClassifier(**params, random_state=42)
+    model.fit(X_train, y_train)
+
+    # Log metrics
+    y_pred = model.predict(X_test)
+    mlflow.log_metric("accuracy", accuracy_score(y_test, y_pred))
+    mlflow.log_metric("f1_score", f1_score(y_test, y_pred))
+
+    # Log the model artifact (saved to S3)
+    mlflow.sklearn.log_model(model, "model")
+
+    print(f"Run ID: {run.info.run_id}")
+    print(f"Artifact URI: {run.info.artifact_uri}")
+```
+
+### Exercise 4: Query Experiments Programmatically
+
+```python
+# scripts/query_experiments.py
+import mlflow
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
+
+# Search for the best run by accuracy
+client = mlflow.MlflowClient()
+experiment = client.get_experiment_by_name("fraud-detection")
+
+runs = client.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    filter_string="metrics.accuracy > 0.9",
+    order_by=["metrics.f1_score DESC"],
+    max_results=5,
+)
+
+print("Top 5 runs by F1 score:")
+for run in runs:
+    print(f"  Run {run.info.run_id[:8]}... | "
+          f"accuracy={run.data.metrics.get('accuracy', 'N/A'):.4f} | "
+          f"f1={run.data.metrics.get('f1_score', 'N/A'):.4f} | "
+          f"n_estimators={run.data.params.get('n_estimators', 'N/A')}")
+```
 
 ---
 
-## Starter Files
+## ECS Fargate Task Definition
 
-Check `lab/starter/` for:
-- Configuration templates to fill in
-- Skeleton code to complete
-- Setup scripts to run
+The MLflow container runs with these settings:
 
-## Solution Files
+```hcl
+resource "aws_ecs_task_definition" "mlflow" {
+  family                   = "${var.project_name}-${var.environment}-mlflow"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = 512    # 0.5 vCPU
+  memory                   = 1024   # 1 GB RAM
 
-If you get stuck, `lab/solution/` contains:
-- Complete working configuration
-- Fully implemented code
-- Expected output examples
-
-> **Important:** Try to complete the exercises yourself first! Looking at solutions too early reduces learning.
+  container_definitions = jsonencode([{
+    name    = "mlflow"
+    image   = "ghcr.io/mlflow/mlflow:v2.10.0"
+    command = [
+      "mlflow", "server",
+      "--host", "0.0.0.0",
+      "--port", "5000",
+      "--backend-store-uri", "postgresql://...",
+      "--default-artifact-root", "s3://mlflow-artifacts/",
+      "--serve-artifacts"
+    ]
+    portMappings = [{ containerPort = 5000 }]
+    healthCheck = {
+      command  = ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval = 30
+    }
+  }])
+}
+```
 
 ---
 
@@ -129,32 +264,32 @@ If you get stuck, `lab/solution/` contains:
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Skipping prerequisites | Module exercises fail | Complete previous modules first |
-| Copy-pasting without understanding | Cannot troubleshoot issues | Read explanations, not just commands |
-| Not checking validation | Think you are done but are not | Run validate.sh after each exercise |
-| Ignoring error messages | Problems compound | Read errors carefully, they tell you what is wrong |
+| MLflow pointed at local storage | Artifacts lost when container restarts | Use `--default-artifact-root s3://...` |
+| No health check on ECS task | Service never reports healthy | Add health check to container definition |
+| RDS publicly accessible | Security vulnerability | Keep RDS in private subnet with SG restrictions |
+| Missing Secrets Manager for DB password | Password in plain text in state | Use `random_password` + `aws_secretsmanager_secret` |
+| Fargate task too small | OOM kills during heavy logging | Increase memory to 2048+ for production |
 
 ---
 
 ## Self-Check Questions
 
-Test your understanding before moving on:
-
-1. What is the main purpose of MLflow Infrastructure Setup?
-2. How does this connect to the previous module?
-3. What would happen in production without this?
-4. Can you explain this concept to a non-technical person?
-5. What are three things that could go wrong, and how would you fix them?
+1. Why do we use RDS PostgreSQL instead of SQLite for the MLflow backend store?
+2. What is the difference between the backend store and the artifact store?
+3. Why is the ALB set to `internal = true` instead of internet-facing?
+4. How does ECS Fargate differ from running MLflow on an EC2 instance?
+5. What happens to experiment data if the ECS container restarts?
 
 ---
 
 ## You Know You Have Completed This Module When...
 
-- [ ] All exercises completed
+- [ ] MLflow tracking server is accessible via the ALB endpoint
+- [ ] RDS PostgreSQL is running with encrypted storage
+- [ ] S3 artifact bucket is created and accessible
+- [ ] Python script successfully logs an experiment to MLflow
+- [ ] MLflow UI shows the logged experiment with metrics and artifacts
 - [ ] Validation script passes: `bash modules/04-mlflow-infrastructure/validation/validate.sh`
-- [ ] You can explain the concepts without looking at notes
-- [ ] You understand how this applies to real-world scenarios
-- [ ] Self-check questions answered confidently
 
 ---
 
@@ -162,24 +297,33 @@ Test your understanding before moving on:
 
 ### Common Issues
 
-**Issue: Validation script fails**
-- Re-read the exercise instructions
-- Check that Docker containers are running
-- Verify you are in the correct directory
-- Compare your work with the solution files
-
-**Issue: Docker container not starting**
+**Issue: MLflow container keeps restarting**
 ```bash
-docker compose logs <service-name>  # Check logs
-docker compose down && docker compose up -d  # Restart
+# Check ECS container logs
+aws logs tail /ecs/ml-platform-dev-mlflow --follow
+
+# Common cause: RDS not ready yet -- check connectivity
+aws rds describe-db-instances --db-instance-identifier ml-platform-dev-mlflow \
+  --query 'DBInstances[0].DBInstanceStatus'
 ```
 
-**Issue: Permission denied**
+**Issue: Cannot connect to MLflow from notebook**
 ```bash
-chmod +x validation/validate.sh  # Make script executable
-sudo chown -R $USER .           # Fix ownership (Linux)
+# Verify the ALB is in the same VPC as the notebook
+aws elbv2 describe-load-balancers \
+  --names ml-platform-dev-mlflow \
+  --query 'LoadBalancers[0].{VpcId:VpcId,DNSName:DNSName,Scheme:Scheme}'
+```
+
+**Issue: Artifacts not saving to S3**
+```bash
+# Check the MLflow task role has S3 access
+aws iam simulate-principal-policy \
+  --policy-source-arn $(terraform output -raw mlflow_execution_role_arn) \
+  --action-names s3:PutObject s3:GetObject \
+  --resource-arns "arn:aws:s3:::ml-platform-dev-mlflow-artifacts/*"
 ```
 
 ---
 
-**Next: [Module 05 →](../05-airflow-infrastructure/)**
+**Next: [Module 05 - Data Lake Setup -->](../05-airflow-infrastructure/)**
